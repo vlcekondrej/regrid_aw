@@ -34,23 +34,25 @@ library(sf)
 library(tidyverse)
 library(ncdf4)
 library(rstudioapi)
+library(dplyr)
 
 scrDir <- dirname(rstudioapi::getSourceEditorContext()$path)
 
 # default settings of non-compulsory variables
-out_file                <- NULL
+out_file_base           <- NULL
 out_dir                 <- NULL
 grd_out_cols_to_keep    <- NULL
 min_coverage            <- 100
 
 write_inp_netcdf_as_shp <- F
 write_inp_raster_as_shp <- F
+write_inp_points_as_shp <- F
 common_crs              <- NULL
+
+coord_digits <- 3
 # end of default settings
 
-inp_nc_coord_dec <- 3
-
-source(paste0(scrDir,"/","regrid_aw_CONF.R"))
+source(paste0(scrDir,"/","regrid_area-weighted_CONF.R"))
 
 setwd(wd)
 
@@ -62,21 +64,22 @@ tbeg <- Sys.time()
 
 # name of output and log files
 # ----------------------------
-if (is.null(out_file)) {
+if (is.null(out_file_base)) {
   ifelse (length(inp_files)==1, 
-          out_file <- gsub(".[a-zA-Z]*$","",basename(inp_files[[1]])), 
-          out_file <- "lot_of_stuff")
-  out_file <- paste0(out_file,"_ON_",basename(grd_out_file))
+          out_file_base <- gsub(".[a-zA-Z]*$","",basename(inp_files[[1]])), 
+          out_file_base <- "lot_of_stuff")
 }
+out_file_base <- paste0(out_file_base,"_ON_",gsub(".[a-zA-Z]*$","",basename(grd_out_file)))
+
 if (!is.null(out_dir)) {
   if (out_dir!="") {
-    out_file <- paste0(out_dir,"/",out_file)  
+    out_file_base <- paste0(out_dir,"/",out_file_base)  
   }
 }
 
-out_log <- gsub(".[a-zA-Z]*$",".log",out_file)
+out_log <- paste0(out_file_base,".log")
 
-outd <- dirname(out_file)
+outd <- dirname(out_log)
 if (!dir.exists(outd) & !outd%in%c("","./")) {
   dir.create(outd)
 } else {
@@ -145,6 +148,10 @@ for (i in 1:length(inp_files)) {
         grd_inp <- st_join(x = grd_poly, y = grd_inp, left = T, join = st_contains)
         rm(grd_poly)
         
+        if (write_inp_points_as_shp) {
+          st_write(obj = grd_inp, dsn = paste0(gsub(".[a-zA-Z]*$","",grd_inp_file),"_POLY.shp", delete_dsn = T, delete_layer = T) )
+        }
+        
         message <- paste0("\n   ... transforming points to polygons took ", round(difftime(time1 = Sys.time(), time2 = t1, units = "min"),1)," min")
         write(message, file=out_log, append=TRUE)
       }
@@ -173,20 +180,24 @@ for (i in 1:length(inp_files)) {
     latdim <- names(ncdata[["dim"]])[tolower(names(ncdata[["dim"]]))%in%c("lat","latitude" )]
     londim <- names(ncdata[["dim"]])[tolower(names(ncdata[["dim"]]))%in%c("lon","longitude")]
     if (length(latdim)==0 | length(londim)==0) {
-      stop("V netCDF nenalezeda dimenze lon nebo lat")
+      message <-"\nPOZOR:\nV netCDF nenalezeda dimenze lon/longitude nebo lat/latitude.\nPreskakuji na dalsi soubor."
+      cat(message)  
+      write(message, file=out_log, append=TRUE)
+      nc_close(ncdata)
+      next
     }
     
-    lats <- ncvar_get(ncdata,latdim) %>% round(.,inp_nc_coord_dec)
+    lats <- ncvar_get(ncdata,latdim) %>% round(.,coord_digits)
     sorted   <- sort(lats)
     nSN      <- length(sorted)
     diffs    <- sorted[2:length(sorted)]-sorted[1:length(sorted)-1] 
-    lat_step <- min(diffs[diffs > 0])
-    lons <- ncvar_get(ncdata,londim) %>% round(.,inp_nc_coord_dec)
+    lat_step <- min(diffs[diffs > 0]) %>% round(.,coord_digits)
+    lons <- ncvar_get(ncdata,londim) %>% round(.,coord_digits)
     lons[lons>180] <- lons[lons>180]-360 # ensure lons are within -180, 180
     sorted   <- sort(lons)
     nWE      <- length(sorted)
     diffs    <- sorted[2:length(sorted)]-sorted[1:length(sorted)-1] 
-    lon_step <- min(diffs[diffs > 0])
+    lon_step <- min(diffs[diffs > 0]) %>% round(.,coord_digits)
     
     vars <- as.data.frame(matrix(nrow = nSN*nWE, 
                                  ncol = 2+length(cols_to_regrid), 
@@ -202,10 +213,9 @@ for (i in 1:length(inp_files)) {
     }
     nc_close(ncdata)
     
-    for (j in c(1:nSN)){
-      vars$lon[(1+(j-1)*nWE) : (j*nWE)] <- lons
-      vars$lat[(1+(j-1)*nWE) : (j*nWE)] <- lats[j]
-    }
+    vars$lon <- lons
+    vars$lat <- rep(lats, each = nWE)
+    
     vars_sf <- vars %>% st_as_sf(.,coords=c("lon","lat"), crs=4326)
     
     e <- as(raster::extent(min(lons)-lon_step/2, max(lons)+lon_step/2,
@@ -224,6 +234,8 @@ for (i in 1:length(inp_files)) {
     
     grd_inp <- st_join(x = grd_poly, y = vars_sf, left = T, join = st_contains)
     rm(grd_poly)
+    rm(vars)
+    rm(vars_sf)
     
     if (write_inp_netcdf_as_shp) {
       st_write(obj = grd_inp, dsn = paste0(gsub(".[a-zA-Z]*$","",grd_inp_file),".shp", delete_dsn = T, delete_layer = T) )
@@ -262,12 +274,13 @@ for (i in 1:length(inp_files)) {
   tmp[cols_to_regrid] <- tmp[cols_to_regrid]*tmp$areaInt/tmp$areaAgg
   tmpAgg <- aggregate(formula(paste0(". ~ ",grd_out_id)), 
                       data=tmp[c(grd_out_id,"areaInt",cols_to_regrid)], FUN="sum")
-  rm(tmp)
-  
   # rename output columns
   colnames(tmpAgg)[which(colnames(tmpAgg)%in%cols_to_regrid)] <- cols_out_name
   
   grd_out <- merge(grd_out, tmpAgg[c(grd_out_id,cols_out_name,"areaInt")], by=grd_out_id, all=T)
+  rm(tmp)
+  rm(tmpAgg)
+  rm(areaAgg)
   
   # delete values in cell which do not have minimum coverage by the input grid
   grd_out[which(is.na(grd_out$areaInt)),"areaInt"] <- 0
@@ -288,15 +301,77 @@ for (i in 1:length(inp_files)) {
 # write output file
 if (common_crs!=out_crs) grd_out <- st_transform(x = grd_out, crs = out_crs)
 
-# list.files(gsub(".[a-zA-Z]*$",".*",out_file))
-# list.files("ETC_stats_EMEP01_rv4_35_2019met_2018emis_O3_PMx_ON_EEA_10kmgrid_2c.*")
-# # file.remove(out_file)
-st_write(obj = grd_out, dsn = out_file, delete_dsn = T, delete_layer = T)
+# problemy s prepisovanim existujicich shapefile - proto se jej nejprve pokousim smazat
+existing_files <- list.files(pattern=basename(out_file_base), recursive = T)
+for (ef in existing_files) {
+  ext <- unlist(strsplit(basename(ef), split="\\."))
+  tmp <- length(ext)
+  ext <- ext[tmp]
+  if ( tolower(ext) %in% c("shp","shx","dbf","sbn","sbx","fbn","fbx","ain","aih","atx","ixs","mxs","prj","xml","cpg") ) {
+    print(ef)
+    file.remove(ef)
+  }
+}
+st_write(obj = grd_out[c(grd_out_id,grd_out_cols_to_keep,unlist(colnames_out))],
+         dsn = paste0(out_file_base,".shp"),
+         delete_dsn = T,
+         delete_layer = T,
+         overwrite = T)
 
-tend <- Sys.time()
 
-message <- paste0("\nProcessing took ", round(difftime(time1 = tend, time2 = tbeg, units = "mins"),1)," min")
+# === write rasters ===
+t1 <- Sys.time()
 
+# add gridcenters coordinates
+xy <- grd_out$geometry %>%
+  st_centroid() %>%
+  st_coordinates() %>%
+  round(.,coord_digits) %>%
+  as.data.frame()
+grd_out$x <- xy$X
+grd_out$y <- xy$Y
+grd_out$x_y <- paste0(grd_out$x,"_",grd_out$y)
+
+# get parameters of FULL output grid
+sorted   <- sort(unique(round(grd_out$x,coord_digits)))
+diffs    <- sorted[2:length(sorted)]-sorted[1:length(sorted)-1] 
+grd_out_dx <- min(diffs[diffs > 0]) 
+grd_out_nx <- (max(sorted)-min(sorted))/grd_out_dx+1
+grd_out_cx <- seq(from=min(sorted), to=max(sorted), by=grd_out_dx)
+#
+sorted   <- sort(unique(round(grd_out$y,coord_digits)))
+diffs    <- sorted[2:length(sorted)]-sorted[1:length(sorted)-1] 
+grd_out_dy <- min(diffs[diffs > 0]) 
+grd_out_ny <- (max(sorted)-min(sorted))/grd_out_dy+1
+grd_out_cy <- seq(from=min(sorted), to=max(sorted), by=grd_out_dy)
+
+# create XYZ field representing FULL output grid
+xy <- matrix(nrow = grd_out_nx*grd_out_ny, data = NA, ncol = 2) %>% as.data.frame(.)
+colnames(xy) <- c("x","y")
+xy$x <- grd_out_cx
+xy$y <- rep(grd_out_cy, each = grd_out_nx)
+xy$x_y <- paste0(xy$x,"_",xy$y)
+xy <- left_join(x=xy, y = as.data.frame(grd_out)[c("x_y",unlist(colnames_out))], )
+
+# create and write raster 
+#  - TOTO Z NEJAKEHO DUVODU PRO VELKE 1KM GRIDY NEFUNGOVALO 
+#    (VRSTVY RASTERU (vystup rasterFromXYZ) NEBYLY POJMENOVANY  
+#     PODLE PROMENYCH A DATA NEBYLA ZAPSANA SPRAVNE)
+# grd_out_rst <- rasterFromXYZ(xy[c("x","y",unlist(colnames_out))], crs=st_crs(out_crs)$proj4string)
+# writeRaster(x = grd_out_rst, filename = paste0(out_file_base,".tif"), bylayer=T, suffix=names(grd_out_rst), overwrite=T)
+
+for (v in unlist(colnames_out)) {
+  grd_out_rst <- rasterFromXYZ(xy[c("x","y",v)], crs=st_crs(out_crs)$proj4string)
+  writeRaster(x = grd_out_rst, filename = paste0(out_file_base,"_",v,".tif"), overwrite=T)
+}
+
+
+message <- paste0("\nRasterization took ", round(difftime(time1 = Sys.time(), time2 = t1, units = "mins"),1)," min")
+cat(message)  
+write(message, file=out_log, append=TRUE)
+
+
+message <- paste0("\nProcessing took ", round(difftime(time1 = Sys.time(), time2 = tbeg, units = "mins"),1)," min")
 cat(message)  
 write(message, file=out_log, append=TRUE)
 
